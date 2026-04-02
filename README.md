@@ -154,6 +154,54 @@ Replace `/path/to/sui-memory` and `/path/to/kizami` with actual paths.
 
 ---
 
+## /recall スキル / The /recall Skill
+
+`kizami/plugin/` を Claude Code プラグインとして登録すると、`/recall` コマンドが使えるようになります。  
+Register `kizami/plugin/` as a Claude Code plugin to enable the `/recall` command.
+
+`/recall` を実行すると Claude が sui-memory DB から直近のセッション履歴を取得し、前回の作業文脈を把握します（出力は要点のみ）。  
+Running `/recall` causes Claude to fetch recent session history from sui-memory DB and silently internalize the previous context.
+
+### セットアップ / Setup
+
+**1. 環境変数を設定する / Set environment variable**
+
+```bash
+# ~/.bashrc または ~/.zshrc に追加 / Add to ~/.bashrc or ~/.zshrc
+export SUI_MEMORY_PATH=/path/to/sui-memory
+```
+
+**2. プラグインを登録する / Register the plugin**
+
+`~/.claude/plugins/known_marketplaces.json` に追記:
+
+```json
+{
+  "local": {
+    "source": { "source": "local" },
+    "installLocation": "/path/to/your-local-marketplace"
+  }
+}
+```
+
+`/path/to/your-local-marketplace` に以下の構造でファイルを配置:
+
+```
+your-local-marketplace/
+├── .claude-plugin/
+│   └── marketplace.json
+└── plugins/
+    └── kizami/         ← kizami/plugin/ の内容をコピー
+        ├── .claude-plugin/
+        │   └── plugin.json
+        └── commands/
+            └── recall.md
+```
+
+**3. Claude Code を再起動して `/recall` を試す**
+
+---
+
 ## 出力サンプル / Output Sample
 
 Claude の文脈に以下のような内容が毎回注入されます。  
