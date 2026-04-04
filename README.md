@@ -66,6 +66,11 @@ This gives Claude awareness of "how many days since last time" and "what were we
    - RRF スコア統合 + 時間減衰
    - 直近7日以内のメモリを最大5件取得
 
+4. 未ベクトル化チャンクの自動処理（バックグラウンド）
+   - embedding=NULL のチャンクが閾値（デフォルト30件）以上の場合
+   - ロックファイルで多重起動を防止しつつバックグラウンドで embed_pending() を実行
+   - 30分以上古いロックは死亡とみなして自動削除
+
     ↓
 これらを結合してシステムプロンプトに注入
 Claude はこの情報を文脈として受け取る
@@ -236,7 +241,7 @@ The following is injected into Claude's context on every prompt:
 | ツール | 役割 |
 |---|---|
 | **[sui-memory](https://github.com/sakuranjunkie-staff/sui-memory)** | 会話の**保存**（StopHook）/ Saves conversations |
-| **kizami** | 時間経過の把握 + 関連メモリの**注入**（UserPromptSubmitHook）/ Time awareness + injection |
+| **kizami** | 時間経過の把握 + 関連メモリの**注入** + **自動ベクトル化**（UserPromptSubmitHook）/ Time awareness + injection + auto-vectorization |
 
 `kizami` は `sui-memory` の `retriever.py` を直接 import して使用します。  
 `kizami` directly imports `retriever.py` from `sui-memory`.
