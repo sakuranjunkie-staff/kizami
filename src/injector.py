@@ -40,17 +40,40 @@ def get_pending_count() -> int:
     try:
         import sqlite3
         con = sqlite3.connect(str(DB_PATH), timeout=1.0)
-        count = con.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL").fetchone()[0]
+        count = con.execute("SELECT COUNT(*) FROM memories WHERE embedding IS NULL").fetchone()[0]
         con.close()
         return count
     except Exception:
         return 0
 
 
+def _try_daemon_embed() -> bool:
+    """sui-memory daemon が ALIVE なら HTTP で embed_pending を投げる。
+    成功したら True、接続失敗・エラーなら False を返す。"""
+    try:
+        import json as _json
+        import urllib.request
+        body = _json.dumps({"batch_size": 50}).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:7766/embed_pending",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return True
+    except Exception:
+        return False
+
+
 def maybe_trigger_embed() -> None:
     """
     未ベクトル化チャンクが閾値以上かつロックファイルが存在しない場合に
-    バックグラウンドでembed_pendingを起動する。
+    embed_pendingを起動する。
+
+    経路:
+      1. sui-memory daemon が ALIVE → HTTP 委譲（プロセス起動不要・高速）
+      2. daemon DEAD → バックグラウンドプロセスでインプロセス embed（従来方式）
 
     ロックファイルが30分以上古い場合はプロセスが死んだとみなして削除する。
     """
@@ -68,7 +91,12 @@ def maybe_trigger_embed() -> None:
     if count < EMBED_THRESHOLD:
         return
 
-    # ロックファイルを作成してバックグラウンドプロセスを起動する
+    # 経路1: daemon が ALIVE なら HTTP で投げる（ロック不要・daemon側で排他制御）
+    if _try_daemon_embed():
+        print(f"[kizami] 未ベクトル化{count}件検知 → daemon経由でembed完了", file=sys.stderr)
+        return
+
+    # 経路2: daemon DEAD → バックグラウンドプロセスでインプロセス embed
     try:
         LOCK_FILE.touch()
 
@@ -131,8 +159,20 @@ def format_memories(memories: list[dict]) -> str:
         if len(assistant_text) > 200:
             assistant_text = assistant_text[:200] + "…"
 
+        # ユーザー発言も上限を設ける（assistant側と対称化）。
+        # user_textを無制限で注入すると、巨大な貼り付け（スキルダンプ・
+        # デバッグ依頼プロンプト等）が丸ごとシステムプロンプトに流れ込み、
+        # 注入ブロックだけで数千トークンを食ってコンテキストを劣化させる。
+        # 閾値500字はDB実測（全7324件）から決めた: user_text長はp90=379字で
+        # 「まともな質問」が頭打ちになり、500字に余白を取ると本物の質問はほぼ
+        # 無傷（切られるのは6.6%＝巨大貼り付け/デバッグ依頼クラスだけ）。
+        # 5件×500字で注入は有界。主題は冒頭に出るのでassistant(200)より長めでよい。
+        user_text = mem.get("user_text", "")
+        if len(user_text) > 500:
+            user_text = user_text[:500] + "…"
+
         lines.append(f"### {i}. {date_str}")
-        lines.append(f"**あなた**: {mem.get('user_text', '')}")
+        lines.append(f"**あなた**: {user_text}")
         lines.append(f"**Claude**: {assistant_text}")
         lines.append("")
 
@@ -171,11 +211,12 @@ def main() -> None:
         reminder = get_full_reminder()
 
         # 関連メモリを検索する（queryがあれば直近7日を対象にする）
+        # KagamiAliceのユーザー会話はClaude Codeとの会話ではないため除外する
         memories: list[dict] = []
         if query:
             # sui-memoryのsearch_recentをここでimportする（パス追加後）
             from retriever import search_recent
-            memories = search_recent(query, limit=5)
+            memories = search_recent(query, limit=5, exclude_project="G:/KagamiAlice")
 
         # 出力ブロックを組み立てる
         blocks: list[str] = []
