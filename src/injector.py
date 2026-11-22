@@ -36,6 +36,9 @@ DB_PATH = Path.home() / ".sui-memory" / "memory.db"
 
 # sui-memory daemon の設定
 SUI_MEMORY_DIR = r"C:\Users\bukol\Documents\sui-memory"
+# uv は場所を固定して呼ぶ。名前だけで呼ぶと、Windows はまず今いるフォルダから探す。
+# このフックは会話を始めたフォルダで動くので、そこに置かれた偽の uv.exe が動きうる（2026-11-23）
+UV_EXE = Path.home() / ".local" / "bin" / "uv.exe"
 DAEMON_URL = "http://127.0.0.1:7766"
 SEARCH_TIMEOUT_SECS = 5.0       # 検索の待ち上限。超えたらキーワード検索に切り替える
 DAEMON_IDLE_TIMEOUT_SECS = 3600  # このフックが立ち上げた daemon は、1時間使われなければ自分で止まる
@@ -112,9 +115,24 @@ def _try_daemon_search(query: str) -> list[dict] | None:
             {"query": query, "limit": 5, "exclude_project": "G:/KagamiAlice"},
             timeout=SEARCH_TIMEOUT_SECS,
         )
-        return res.get("memories", [])
     except Exception:
         return None
+    # 返事の形を確かめてから使う。同じ口で別のプログラムが待ち受けていた場合に、
+    # 想定外の形や件数のものを注入に流さない（2026-11-23）
+    mems = res.get("memories") if isinstance(res, dict) else None
+    if not isinstance(mems, list):
+        return None
+    cleaned: list[dict] = []
+    for m in mems[:5]:
+        if not isinstance(m, dict):
+            continue
+        # 注入に使う3項目だけを文字列として持つ（長さは format_memories が切る）
+        cleaned.append({
+            "timestamp": str(m.get("timestamp", "")),
+            "user_text": str(m.get("user_text", "")),
+            "assistant_text": str(m.get("assistant_text", "")),
+        })
+    return cleaned
 
 
 def _spawn_daemon() -> None:
@@ -127,12 +145,16 @@ def _spawn_daemon() -> None:
     try:
         if SPAWN_MARK.exists() and time.time() - SPAWN_MARK.stat().st_mtime < SPAWN_COOLDOWN_SECS:
             return
+        if not UV_EXE.is_file():
+            print(f"[kizami] uv が見つからないので daemon を立ち上げない: {UV_EXE}", file=sys.stderr)
+            return
         SPAWN_MARK.parent.mkdir(parents=True, exist_ok=True)
         SPAWN_MARK.touch()
         env = dict(os.environ)
         env["SUI_MEMORY_IDLE_TIMEOUT"] = str(DAEMON_IDLE_TIMEOUT_SECS)
         subprocess.Popen(
-            ["uv", "run", "--directory", SUI_MEMORY_DIR, "python", "-m", "src.daemon"],
+            [str(UV_EXE), "run", "--directory", SUI_MEMORY_DIR, "python", "-m", "src.daemon"],
+            cwd=SUI_MEMORY_DIR,  # 作業フォルダも固定する（会話を始めたフォルダで動かさない）
             env=env,
             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             stdin=subprocess.DEVNULL,
