@@ -205,7 +205,14 @@ function Invoke-AutoSl([System.IO.FileInfo]$j) {
         'Read(//c/Users/bukol/Documents/session_logs/**)',
         'Glob'
     )
-    $denyTools = @('Bash', 'PowerShell', 'WebFetch', 'WebSearch', 'Agent')
+    # 写しに存在させる道具そのものを --tools で決め打ちする（ここに無い道具は最初から無い）。
+    # 禁止を並べる形だと、別セッションへ文章を送る・作業員を動かす・予約を仕掛ける等の道具が
+    # 増えるたびに回り込みの穴が開く。MCP の道具（ブラウザ操作・Blender でのコード実行など）は
+    # --strict-mcp-config（--mcp-config を渡さない）で一つも読み込ませない（2026-11-23）
+    $toolSet = 'Read,Write,Edit,Glob,Skill'
+    # 念のための二重化：決め打ちが効かなかった場合でも、シェル等は禁止で止まる
+    $denyTools = @('Bash', 'PowerShell', 'WebFetch', 'WebSearch', 'Agent', 'Task', 'NotebookEdit',
+        'SendMessage', 'Workflow', 'RemoteTrigger', 'CronCreate')
     $fireStart = Get-Date
     # 写し（--fork-session）で撃つ：元のセッションが裏で動いている最中でも開ける。
     # 元のセッションに/slの往復を書き足さない（2026-11-18 流の指示。写しは上の見張りで巡回から外れる）
@@ -213,7 +220,7 @@ function Invoke-AutoSl([System.IO.FileInfo]$j) {
     # （元の会話の複製が別の会話IDでDBに入り、検索に二重に出ていた・2026-11-23）
     $env:KIZAMI_AUTO_SL_FORK = '1'
     try {
-        $out = & claude -p $prompt --resume $id --fork-session --allowedTools @allowTools --disallowedTools @denyTools 2>&1 | Out-String
+        $out = & claude -p $prompt --resume $id --fork-session --tools $toolSet --strict-mcp-config --allowedTools @allowTools --disallowedTools @denyTools 2>&1 | Out-String
         $claudeExit = $LASTEXITCODE
     } finally {
         Remove-Item Env:KIZAMI_AUTO_SL_FORK -ErrorAction SilentlyContinue
@@ -221,8 +228,16 @@ function Invoke-AutoSl([System.IO.FileInfo]$j) {
     Add-Content $log $out
     # 成功判定は完了報告を盲信せず現物で：exit 0＋resume成功＋（session_logが書かれた or 意図的見送りの合図）
     # 見送りを失敗扱いにすると印が焼かれず巡回のたび再発火する（2026-08-10実害＝無限ループ）
-    $slTouched = Get-ChildItem 'C:\Users\bukol\Documents\session_logs\session_log_*.md' |
-        Where-Object { $_.LastWriteTime -gt $fireStart } | Select-Object -First 1
+    # 撃った後に更新された記録を探す。ちょうど1つの時だけ、この写しが書いた物とみなす。
+    # 同じ時間に別の会話で /sl が書かれていると、2つ以上が当たる。その場合は会話全文を
+    # 違うファイルに足しかねないので、失敗として扱う（2026-11-23）
+    $touchedAll = @(Get-ChildItem 'C:\Users\bukol\Documents\session_logs\session_log_*.md' |
+        Where-Object { $_.LastWriteTime -gt $fireStart })
+    $slTouched = $null
+    if ($touchedAll.Count -eq 1) { $slTouched = $touchedAll[0] }
+    elseif ($touchedAll.Count -gt 1) {
+        Add-Content $log "$(Get-Date -Format s) $id ambiguous: $($touchedAll.Count) session_logs written since fire - not appending"
+    }
     # 見送りの合図は「最後の行が SL_SKIP_OK の一語だけ」の時に限る。文字列が含まれるだけで認めると、
     # 「SL_SKIP_OK ではない」と書いた失敗報告まで見送り扱いになり、未蒸留の分に済みの印を焼いていた（2026-11-23 実害）
     $lastLine = (($out -split "`r?`n") | Where-Object { $_ -match '\S' } | Select-Object -Last 1)
