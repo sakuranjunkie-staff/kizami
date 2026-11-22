@@ -4,11 +4,16 @@ injector.py - UserPromptSubmitHook エントリーポイント
 時間サマリー・リマインド・関連メモリ（直近7日）を統合して
 Claude Codeのシステムプロンプトに注入するためのテキストをstdoutに出力する。
 
-また、未ベクトル化チャンクが閾値を超えた場合に
-バックグラウンドでembed_pendingを自動起動する。
+関連メモリの検索は、モデルを読み込み済みの sui-memory daemon に頼む（2026-11-23）。
+このフックは発言のたびに新しいプロセスで立ち上がるため、自分で検索すると
+毎回モデル（約1.2GB）を読み込み直して約9秒かかっていた。
+daemon が動いていなければ裏で立ち上げ、その回だけキーワード検索で済ませる。
+
+また、未ベクトル化チャンクが閾値を超えた場合に daemon へ embed_pending を頼む。
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -27,9 +32,17 @@ sys.path.insert(0, str(SUI_MEMORY_SRC))
 
 # バックグラウンドembed設定
 EMBED_THRESHOLD = 30                                          # この件数以上で自動起動
-LOCK_FILE = Path.home() / ".sui-memory" / "embed_pending.lock"
 DB_PATH = Path.home() / ".sui-memory" / "memory.db"
-LOCK_STALE_SECS = 1800                                        # 30分以上古いロックは無視する
+
+# sui-memory daemon の設定
+SUI_MEMORY_DIR = r"C:\Users\bukol\Documents\sui-memory"
+DAEMON_URL = "http://127.0.0.1:7766"
+SEARCH_TIMEOUT_SECS = 5.0       # 検索の待ち上限。超えたらキーワード検索に切り替える
+DAEMON_IDLE_TIMEOUT_SECS = 3600  # このフックが立ち上げた daemon は、1時間使われなければ自分で止まる
+# 立ち上げの重複防止：daemon はモデルを読み込み終えるまで（約10秒）応答しない。
+# その間に次の発言が来ても、もう一つ立ち上げないための印と、その有効時間
+SPAWN_MARK = Path.home() / ".sui-memory" / "daemon_spawn.mark"
+SPAWN_COOLDOWN_SECS = 120
 
 from timeline import get_timeline_summary
 from reminder import get_full_reminder
@@ -76,86 +89,83 @@ def get_pending_count() -> int:
         return 0
 
 
-def _try_daemon_embed() -> bool:
-    """sui-memory daemon が ALIVE なら HTTP で embed_pending を投げる。
-    成功したら True、接続失敗・エラーなら False を返す。"""
+def _post_daemon(path: str, payload: dict, timeout: float):
+    """daemon に JSON を POST して、返ってきた JSON を dict で返す。
+    つながらない・時間切れ・エラーのときは例外をそのまま投げる（呼び出し側で判断する）。"""
+    import urllib.request
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        DAEMON_URL + path,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _try_daemon_search(query: str) -> list[dict] | None:
+    """daemon に直近7日のハイブリッド検索を頼む。daemon が使えなければ None を返す。"""
     try:
-        import json as _json
-        import urllib.request
-        body = _json.dumps({"batch_size": 50}).encode("utf-8")
-        req = urllib.request.Request(
-            "http://127.0.0.1:7766/embed_pending",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        res = _post_daemon(
+            "/search_recent",
+            {"query": query, "limit": 5, "exclude_project": "G:/KagamiAlice"},
+            timeout=SEARCH_TIMEOUT_SECS,
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return True
+        return res.get("memories", [])
     except Exception:
-        return False
+        return None
 
 
-def maybe_trigger_embed() -> None:
+def _spawn_daemon() -> None:
+    """daemon を裏で立ち上げる（画面は出さない・待たない）。
+
+    直近 SPAWN_COOLDOWN_SECS 以内に立ち上げていれば何もしない。daemon はモデルを
+    読み込み終えるまで応答しないので、その間の発言でもう一つ立ち上げると、
+    モデルの読み込みが二重に走る（二つ目はポートが取れずに終わるが、読み込みは無駄になる）。
     """
-    未ベクトル化チャンクが閾値以上かつロックファイルが存在しない場合に
-    embed_pendingを起動する。
-
-    経路:
-      1. sui-memory daemon が ALIVE → HTTP 委譲（プロセス起動不要・高速）
-      2. daemon DEAD → バックグラウンドプロセスでインプロセス embed（従来方式）
-
-    ロックファイルが30分以上古い場合はプロセスが死んだとみなして削除する。
-    """
-    # ロックファイルの存在チェック（古いロックは削除する）
-    if LOCK_FILE.exists():
-        age = time.time() - LOCK_FILE.stat().st_mtime
-        if age < LOCK_STALE_SECS:
-            return  # 実行中なのでスキップ
-        # 古いロック（プロセス死亡とみなす）を削除する
-        LOCK_FILE.unlink(missing_ok=True)
-        print("[kizami] 古いロックファイルを削除しました", file=sys.stderr)
-
-    # 未ベクトル化件数を確認する
-    count = get_pending_count()
-    if count < EMBED_THRESHOLD:
-        return
-
-    # 経路1: daemon が ALIVE なら HTTP で投げる（ロック不要・daemon側で排他制御）
-    if _try_daemon_embed():
-        print(f"[kizami] 未ベクトル化{count}件検知 → daemon経由でembed完了", file=sys.stderr)
-        return
-
-    # 経路2: daemon DEAD → バックグラウンドプロセスでインプロセス embed
     try:
-        LOCK_FILE.touch()
-
-        # バックグラウンドで実行するインラインスクリプト
-        # ロックファイルはスクリプト側で削除する（失敗時も確実に消す）
-        script = (
-            "import sys; sys.path.insert(0, r'C:\\Users\\bukol\\Documents\\sui-memory\\src'); "
-            "from pathlib import Path; "
-            "lock = Path.home() / '.sui-memory' / 'embed_pending.lock'; "
-            "try:\n"
-            "    from storage import init_db, embed_pending\n"
-            "    init_db()\n"
-            "    n = embed_pending(batch_size=50)\n"
-            "finally:\n"
-            "    lock.unlink(missing_ok=True)"
-        )
-
+        if SPAWN_MARK.exists() and time.time() - SPAWN_MARK.stat().st_mtime < SPAWN_COOLDOWN_SECS:
+            return
+        SPAWN_MARK.parent.mkdir(parents=True, exist_ok=True)
+        SPAWN_MARK.touch()
+        env = dict(os.environ)
+        env["SUI_MEMORY_IDLE_TIMEOUT"] = str(DAEMON_IDLE_TIMEOUT_SECS)
         subprocess.Popen(
-            ["uv", "run", "--project", r"C:\Users\bukol\Documents\sui-memory", "python", "-c", script],
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            ["uv", "run", "--directory", SUI_MEMORY_DIR, "python", "-m", "src.daemon"],
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
-        print(f"[kizami] 未ベクトル化{count}件検知 → バックグラウンドでembed_pending起動", file=sys.stderr)
-
+        print("[kizami] daemon が動いていないので裏で立ち上げた", file=sys.stderr)
     except Exception as e:
-        # 起動失敗時はロックファイルを削除して次回に備える
-        LOCK_FILE.unlink(missing_ok=True)
-        print(f"[kizami] auto-embed起動失敗: {e}", file=sys.stderr)
+        print(f"[kizami] daemon の立ち上げに失敗: {e}", file=sys.stderr)
+
+
+def maybe_trigger_embed() -> None:
+    """
+    未ベクトル化チャンクが閾値以上なら、daemon に embed_pending を頼む。
+
+    返事は待たない（時間切れを短くして、頼んだらすぐ戻る）。daemon は接続が切れても
+    受けた処理を最後まで続ける。以前は最大30秒待っていて、そのぶん発言が待たされていた。
+    daemon が動いていなければ何もしない（検索側が立ち上げるので、次の発言で頼める）。
+    以前の「daemon が無ければ別プロセスでモデルを読み込んでベクトル化」は、daemon の
+    立ち上げとモデルの読み込みが重なるので廃止した（2026-11-23）。
+    """
+    count = get_pending_count()
+    if count < EMBED_THRESHOLD:
+        return
+    try:
+        _post_daemon("/embed_pending", {"batch_size": 50}, timeout=1.0)
+    except TimeoutError:
+        # 頼んだ後の時間切れ＝daemon は処理を続けている
+        print(f"[kizami] 未ベクトル化{count}件 → daemon に依頼した", file=sys.stderr)
+    except Exception:
+        # つながらない（daemon が止まっている）等。次の発言で頼む
+        pass
 
 
 def format_memories(memories: list[dict]) -> str:
@@ -243,9 +253,16 @@ def main() -> None:
         # KagamiAliceのユーザー会話はClaude Codeとの会話ではないため除外する
         memories: list[dict] = []
         if query:
-            # sui-memoryのsearch_recentをここでimportする（パス追加後）
-            from retriever import search_recent
-            memories = search_recent(query, limit=5, exclude_project="G:/KagamiAlice")
+            # まず daemon に頼む（モデル読み込み済みなので速い）
+            found = _try_daemon_search(query)
+            if found is None:
+                # daemon が使えない：裏で立ち上げ、この回はキーワード検索だけで済ませる
+                # （モデルを読み込まないので一瞬で終わる。次の発言からは daemon が答える）
+                _spawn_daemon()
+                from retriever import search_recent
+                found = search_recent(query, limit=5, exclude_project="G:/KagamiAlice",
+                                      use_vector=False)
+            memories = found
 
         # 出力ブロックを組み立てる
         blocks: list[str] = []
