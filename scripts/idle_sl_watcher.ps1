@@ -178,12 +178,34 @@ function Invoke-AutoSl([System.IO.FileInfo]$j) {
     if (-not (Test-Path $cwd)) { $cwd = 'C:\Users\bukol' }
     Set-Location $cwd
     $tp = $j.FullName -replace '\\', '/'
+    # 写しの中ではシェルを一切使わせない（2026-11-23 流決裁）。写しは元の会話を丸ごと持っており、
+    # そこにはウェブやダウンロード物から取り込んだ文章も混ざる。仕込まれた指示に従って、
+    # 無人のまま確認なしでコマンドが走る恐れがあった。/slでシェルが要るのは _sl_dump.py の2回だけなので、
+    # 1回目（Step2＝時刻と往復数）は上で出した $times を指示文で渡し、2回目（Step5＝生ログの追記）は
+    # 写しが要点を書き終えた後にこの巡回が自分で撃つ。
+    $timesLine = (($times -split "`r?`n") | Where-Object { $_ -match '\S' }) -join ' / '
     # SL_SKIP_OK＝「焼く価値のある差分なし」の正規の見送り合図（2026-08-10・焼き直し禁止設計との整合）
-    $prompt = "/sl。対象=$tp に固定（ls -t禁止）。Step7(/sr)スキップ（watcher側で実行する）。Step6b(印焼き)もスキップ（watcher側で焼く）。焼く価値のある差分が無ければ新規ファイルを作らず、応答に SL_SKIP_OK と明記して終われ。"
+    $prompt = "/sl。対象=$tp。自動/slなので次を守れ：Bash・PowerShellは禁止されていて使えない。" +
+        "Step1とStep2は撃つな（Step2の結果＝$timesLine）。Step5（生ログの追記）とStep6b（印焼き）は巡回が撃つので撃つな。" +
+        "保存は C:\Users\bukol\Documents\session_logs\ の下にWriteで新規作成する（C:\slog 経由のパスは使うな）。" +
+        "同日・同ラベルのファイルがあるかはGlobで確かめてよい。" +
+        "焼く価値のある差分が無ければ新規ファイルを作らず、応答の最後の行を SL_SKIP_OK の一語だけにして終われ（失敗した時はこの語を書くな）。"
     if ($since -gt [datetime]::MinValue) {
         # 増分蒸留：前回焼き終えた実会話時刻（sl_time）を基点に、それ以降だけ焼かせる（2026-08-05 流決裁）
-        $prompt += "増分蒸留=--since $($since.ToUniversalTime().ToString('o'))（sl.mdの増分蒸留節に従え）。"
+        $prompt += "増分蒸留=--since $($since.ToUniversalTime().ToString('o'))（sl.mdの増分蒸留節に従え。範囲はStep2の結果のとおり）。"
     }
+    # 写しに許す道具：session_log_*.md の書き込みと、session_logs の読み取りとファイル名の確認だけ。
+    # 書き込みを session_logs 全体にすると、巡回が後で動かす _sl_dump.py（や uv の設定）を写しが
+    # 書き換えられ、シェル禁止を回り込めてしまう。だから書けるのは記録のファイル名の形だけにする（2026-11-23）。
+    # シェル・ウェブ・サブエージェントは「禁止」で渡す（禁止はどこの許可よりも優先される）
+    # ファイルを書く道具のパス指定は Edit(...) の形で書く（Write(...) はパス判定に使われない。
+    # Edit の規則が Write を含む全ての書き込み道具に効く・2026-11-23 実地で確認）
+    $allowTools = @(
+        'Edit(//c/Users/bukol/Documents/session_logs/session_log_*.md)',
+        'Read(//c/Users/bukol/Documents/session_logs/**)',
+        'Glob'
+    )
+    $denyTools = @('Bash', 'PowerShell', 'WebFetch', 'WebSearch', 'Agent')
     $fireStart = Get-Date
     # 写し（--fork-session）で撃つ：元のセッションが裏で動いている最中でも開ける。
     # 元のセッションに/slの往復を書き足さない（2026-11-18 流の指示。写しは上の見張りで巡回から外れる）
@@ -191,7 +213,7 @@ function Invoke-AutoSl([System.IO.FileInfo]$j) {
     # （元の会話の複製が別の会話IDでDBに入り、検索に二重に出ていた・2026-11-23）
     $env:KIZAMI_AUTO_SL_FORK = '1'
     try {
-        $out = & claude -p $prompt --resume $id --fork-session --allowedTools "Write,Bash,PowerShell" 2>&1 | Out-String
+        $out = & claude -p $prompt --resume $id --fork-session --allowedTools @allowTools --disallowedTools @denyTools 2>&1 | Out-String
         $claudeExit = $LASTEXITCODE
     } finally {
         Remove-Item Env:KIZAMI_AUTO_SL_FORK -ErrorAction SilentlyContinue
@@ -201,7 +223,19 @@ function Invoke-AutoSl([System.IO.FileInfo]$j) {
     # 見送りを失敗扱いにすると印が焼かれず巡回のたび再発火する（2026-08-10実害＝無限ループ）
     $slTouched = Get-ChildItem 'C:\Users\bukol\Documents\session_logs\session_log_*.md' |
         Where-Object { $_.LastWriteTime -gt $fireStart } | Select-Object -First 1
-    $skipOk = ($out -match 'SL_SKIP_OK')
+    # 見送りの合図は「最後の行が SL_SKIP_OK の一語だけ」の時に限る。文字列が含まれるだけで認めると、
+    # 「SL_SKIP_OK ではない」と書いた失敗報告まで見送り扱いになり、未蒸留の分に済みの印を焼いていた（2026-11-23 実害）
+    $lastLine = (($out -split "`r?`n") | Where-Object { $_ -match '\S' } | Select-Object -Last 1)
+    $skipOk = ($null -ne $lastLine) -and ($lastLine.Trim() -eq 'SL_SKIP_OK')
+    # Step5の代わり：写しが書いた要点の後ろに、会話の全文を巡回が追記する（写しにはシェルを渡していないため）
+    if ($claudeExit -eq 0 -and $slTouched) {
+        Push-Location C:\Users\bukol\Documents\session_logs
+        $dumpOut = & uv run python _sl_dump.py $j.FullName $slTouched.FullName @sinceArgs 2>&1 | Out-String
+        $dumpExit = $LASTEXITCODE
+        Pop-Location
+        Add-Content $log "$(Get-Date -Format s) $id raw log append (exit=$dumpExit): $($dumpOut.Trim())"
+        if ($dumpExit -ne 0) { $slTouched = $null }  # 追記に失敗したら失敗扱い（印を焼かず、失敗を知らせる）
+    }
     $distilled = ($claudeExit -eq 0) -and ($out -notmatch 'No conversation found') -and ($slTouched -or $skipOk)
     if ($distilled) {
         # 成功してから印を焼く。基本は発火判定時点の実会話時刻＝蒸留中に増えた分は次回拾う。
