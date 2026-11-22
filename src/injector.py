@@ -34,6 +34,35 @@ LOCK_STALE_SECS = 1800                                        # 30分以上古�
 from timeline import get_timeline_summary
 from reminder import get_full_reminder
 
+# idle_sl_watcherが失敗印（*.sl_fail）を置く場所（2026-08-10 流の指示で注入対象に追加）
+MARKERS_DIR = Path.home() / ".claude" / "kizami_markers"
+
+
+def get_sl_failures() -> str:
+    """未処理のオート/sl失敗印を注入用テキストにする。無ければ空文字。
+
+    印は idle_sl_watcher.ps1 が蒸留失敗時に焼き、後続の成功時に自動で消す。
+    デスクトップ通知を見ていなくても、セッション内のClaudeが失敗に
+    気づいてユーザーに報告できるようにするのが目的。
+    """
+    try:
+        fails = sorted(MARKERS_DIR.glob("*.sl_fail"))
+        if not fails:
+            return ""
+        lines = [
+            "## ⚠ オート/sl失敗（未処理）",
+            "（注: idle_sl_watcherの蒸留失敗印。ユーザーに報告せよ。対処されるか後続の自動/slが成功すると消える）",
+        ]
+        for f in fails:
+            try:
+                detail = f.read_text(encoding="utf-8").strip().splitlines()[0]
+            except Exception:
+                detail = "(詳細読み取り不能)"
+            lines.append(f"- セッション {f.stem[:8]}…: {detail}／詳細=~\\.claude\\kizami_markers\\watcher.log")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
 
 def get_pending_count() -> int:
     """embedding=NULLのチャンク数を返す。DBアクセス失敗時は0を返す。"""
@@ -228,6 +257,11 @@ def main() -> None:
         # リマインド（空文字なら省略）
         if reminder:
             blocks.append(reminder)
+
+        # オート/sl失敗の未処理印（あれば警告として注入する）
+        sl_fail = get_sl_failures()
+        if sl_fail:
+            blocks.append(sl_fail)
 
         # 関連メモリ
         blocks.append(format_memories(memories))
